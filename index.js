@@ -27,9 +27,9 @@ app.use(express.json());
 app.use(limiter);
 
 /**
- * Extracts video/reel ID from various Facebook URL formats
+ * Extracts media ID and type from various Facebook URL formats
  * @param {string} input - Can be ID or full URL
- * @returns {object} {id: string, type: 'video'|'reel'|null}
+ * @returns {object} {id: string, type: 'video'|'reel'|'shared_video'|'shared_reel'|null}
  */
 function extractMediaId(input) {
   if (!input) return { id: null, type: null };
@@ -39,24 +39,37 @@ function extractMediaId(input) {
 
   try {
     const url = new URL(input.includes('://') ? input : `https://${input}`);
+    const host = url.hostname.replace('www.', '');
     
-    if (url.hostname.includes('facebook.com') || url.hostname.includes('fb.watch')) {
-      // Reels format: https://www.facebook.com/reel/123456789
-      const reelMatch = url.pathname.match(/\/reel\/(\d+)/);
+    // Main Facebook domains
+    if (host.includes('facebook.com') || host.includes('fb.watch') || host.includes('fb.com')) {
+      // Standard Reel URL
+      const reelMatch = url.pathname.match(/\/(?:reel|reels)\/(\d+)/i);
       if (reelMatch) return { id: reelMatch[1], type: 'reel' };
       
-      // Watch format: https://www.facebook.com/watch/?v=123456789
+      // Shared Reel URL (from mobile or share)
+      const sharedReelMatch = url.pathname.match(/\/videos\/reel\/(\d+)/i) || 
+                             url.pathname.match(/\/watch\/\?story_fbid=(\d+)/i);
+      if (sharedReelMatch) return { id: sharedReelMatch[1], type: 'shared_reel' };
+      
+      // Standard Video URL
       if (url.pathname === '/watch/' && url.searchParams.get('v')) {
         return { id: url.searchParams.get('v'), type: 'video' };
       }
       
-      // Video format: https://www.facebook.com/username/videos/123456789/
-      const videoMatch = url.pathname.match(/\/videos\/(\d+)/);
-      if (videoMatch) return { id: videoMatch[1], type: 'video' };
+      // Shared Video URL (from posts)
+      const videoMatch = url.pathname.match(/\/videos\/(?:\d+)\/(\d+)/i) || 
+                        url.pathname.match(/\/video\.php\?(?:.*)v=(\d+)/i);
+      if (videoMatch) return { id: videoMatch[1], type: 'shared_video' };
       
-      // FB Watch format: https://fb.watch/abcde12345/
-      if (url.hostname.includes('fb.watch')) {
+      // FB Watch URL
+      if (host.includes('fb.watch')) {
         return { id: url.pathname.split('/')[1], type: 'video' };
+      }
+      
+      // Mobile share links
+      if (url.searchParams.get('story_fbid')) {
+        return { id: url.searchParams.get('story_fbid'), type: 'shared_reel' };
       }
     }
   } catch (e) {
@@ -67,16 +80,24 @@ function extractMediaId(input) {
 }
 
 /**
- * Extracts video/reel URLs from Facebook
+ * Extracts media URLs and metadata from Facebook
  * @param {string} mediaId - Facebook media ID
- * @param {string} mediaType - 'video' or 'reel'
- * @returns {Promise<Object>} Object containing media URLs and status
+ * @param {string} mediaType - Type of media
+ * @returns {Promise<Object>} Object containing media data
  */
-async function extractMediaUrls(mediaId, mediaType) {
+async function extractMediaData(mediaId, mediaType) {
   try {
-    const url = mediaType === 'reel' 
-      ? `https://www.facebook.com/reel/${mediaId}`
-      : `https://www.facebook.com/watch/?v=${mediaId}`;
+    let url;
+    switch(mediaType) {
+      case 'reel':
+      case 'shared_reel':
+        url = `https://www.facebook.com/reel/${mediaId}`;
+        break;
+      case 'video':
+      case 'shared_video':
+      default:
+        url = `https://www.facebook.com/watch/?v=${mediaId}`;
+    }
 
     const response = await axios.get(url, {
       headers: {
@@ -90,24 +111,41 @@ async function extractMediaUrls(mediaId, mediaType) {
     const $ = cheerio.load(response.data);
     const pageContent = $.html();
 
-    // Patterns for both videos and reels
+    // Extract video URLs
     const urlPatterns = {
       hd: /(?:hd|high_quality)_src\s*[=:]\s*["']([^"']+)/i,
       sd: /(?:sd|standard_quality)_src\s*[=:]\s*["']([^"']+)/i,
       fallback: /(?:video|src)_src\s*[=:]\s*["']([^"']+)/i
     };
 
-    const results = {};
+    const downloadLinks = {};
     for (const [quality, pattern] of Object.entries(urlPatterns)) {
       const match = pageContent.match(pattern);
-      if (match && match[1]) results[quality] = match[1];
+      if (match && match[1]) downloadLinks[quality] = match[1];
     }
 
+    // Extract metadata
+    const titleMatch = pageContent.match(/<title[^>]*>([^<]+)<\/title>/i);
+    const title = titleMatch ? titleMatch[1].replace(' | Facebook', '').trim() : null;
+    
+    const descriptionMatch = pageContent.match(/<meta\s+name="description"\s+content="([^"]+)/i);
+    const description = descriptionMatch ? descriptionMatch[1].trim() : null;
+
+    const thumbnailMatch = pageContent.match(/<meta\s+property="og:image"\s+content="([^"]+)/i);
+    const thumbnail = thumbnailMatch ? thumbnailMatch[1] : null;
+
     return {
-      ...results,
       success: true,
       mediaId,
-      mediaType
+      mediaType,
+      metadata: {
+        title,
+        description,
+        thumbnail,
+        sourceUrl: url
+      },
+      downloadLinks,
+      timestamp: new Date().toISOString()
     };
   } catch (error) {
     console.error(`Extraction Error: ${error.message}`);
@@ -123,50 +161,40 @@ async function extractMediaUrls(mediaId, mediaType) {
 app.get('/download', async (req, res) => {
   const { videoId, reelId, url } = req.query;
   
-  // Use either specific ID or URL parameter
   const input = videoId || reelId || url;
   if (!input) {
     return res.status(400).json({
       success: false,
-      message: 'Either videoId, reelId, or url parameter is required'
+      message: 'Either videoId, reelId, or url parameter is required',
+      example: '/download?url=https://www.facebook.com/username/videos/123456789'
     });
   }
 
-  // Extract media ID and type
   const { id: mediaId, type: mediaType } = extractMediaId(input);
   if (!mediaId || !mediaType) {
     return res.status(400).json({
       success: false,
-      message: 'Invalid Facebook video/reel ID or URL format',
+      message: 'Invalid Facebook video/reel URL format',
       supportedFormats: [
         'Video ID: 123456789',
         'Video URL: https://www.facebook.com/watch/?v=123456789',
-        'Video URL: https://www.facebook.com/username/videos/123456789/',
+        'Shared Video: https://www.facebook.com/username/videos/123456789/',
         'Reel URL: https://www.facebook.com/reel/123456789',
-        'FB Watch URL: https://fb.watch/abcde12345/'
+        'Shared Reel: https://www.facebook.com/username/posts/123456789',
+        'Mobile Share: https://m.facebook.com/story.php?story_fbid=123456789',
+        'FB Watch: https://fb.watch/abcde12345/'
       ]
     });
   }
 
   try {
-    const mediaData = await extractMediaUrls(mediaId, mediaType);
+    const mediaData = await extractMediaData(mediaId, mediaType);
     
     if (!mediaData.success) {
       return res.status(404).json(mediaData);
     }
 
-    res.json({
-      success: true,
-      originalInput: input,
-      mediaId,
-      mediaType,
-      downloadLinks: {
-        hd: mediaData.hd,
-        sd: mediaData.sd,
-        fallback: mediaData.fallback
-      },
-      timestamp: new Date().toISOString()
-    });
+    res.json(mediaData);
   } catch (error) {
     console.error(`API Error: ${error.message}`);
     res.status(500).json({
@@ -176,49 +204,50 @@ app.get('/download', async (req, res) => {
   }
 });
 
-// Health and status endpoints
+// Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK',
     uptime: process.uptime(),
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    version: '1.1.0'
   });
 });
 
+// Documentation endpoint
 app.get('/', (req, res) => {
   res.json({
     service: 'Facebook Video & Reel Downloader API',
-    status: 'running',
+    description: 'Download videos and reels including shared content from posts',
+    version: '1.1.0',
     endpoints: {
       download: {
-        description: 'Download video or reel by ID or URL',
+        method: 'GET',
         parameters: {
-          videoId: 'Facebook video ID',
-          reelId: 'Facebook reel ID',
-          url: 'Full Facebook video/reel URL'
+          videoId: 'Numeric video ID',
+          reelId: 'Numeric reel ID',
+          url: 'Full Facebook URL'
         },
         examples: [
           '/download?url=https://www.facebook.com/watch/?v=123456789',
           '/download?url=https://www.facebook.com/reel/123456789',
+          '/download?url=https://m.facebook.com/story.php?story_fbid=123456789',
           '/download?videoId=123456789',
           '/download?reelId=123456789'
         ]
       },
-      health: '/health'
+      health: {
+        method: 'GET',
+        description: 'Service health check'
+      }
     }
-  });
-});
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error(`Unhandled Error: ${err.stack}`);
-  res.status(500).json({
-    success: false,
-    message: 'An unexpected error occurred'
   });
 });
 
 // Start server
 app.listen(PORT, () => {
   console.log(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
+  console.log(`API documentation: http://localhost:${PORT}/`);
 });
+
+module.exports = app;
